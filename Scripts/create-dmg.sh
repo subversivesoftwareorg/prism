@@ -148,23 +148,39 @@ else
 fi
 
 # ── Code signing ──────────────────────────────────────────────────
+# Timestamped signing depends on Apple's timestamp service, which
+# occasionally drops requests mid-run. Retry transient failures
+# before giving up on the whole release.
+retry() {
+    _attempt=1
+    while ! "$@"; do
+        if [ "$_attempt" -ge 3 ]; then
+            echo "Error: command failed after 3 attempts: $*"
+            return 1
+        fi
+        echo "    Transient failure, retrying ($_attempt/3)..."
+        _attempt=$((_attempt + 1))
+        sleep 5
+    done
+}
+
 if [ -n "$IDENTITY" ]; then
     echo "==> Signing embedded frameworks and helpers..."
     SPARKLE_FW="$APP_PATH/Contents/Frameworks/Sparkle.framework"
     if [ -d "$SPARKLE_FW" ]; then
         for xpc in "$SPARKLE_FW"/Versions/B/XPCServices/*.xpc; do
-            [ -d "$xpc" ] && codesign --force --options runtime --sign "$IDENTITY" --timestamp "$xpc"
+            [ -d "$xpc" ] && retry codesign --force --options runtime --sign "$IDENTITY" --timestamp "$xpc"
         done
         for helper in "$SPARKLE_FW"/Versions/B/*.app; do
-            [ -d "$helper" ] && codesign --force --options runtime --sign "$IDENTITY" --timestamp "$helper"
+            [ -d "$helper" ] && retry codesign --force --options runtime --sign "$IDENTITY" --timestamp "$helper"
         done
         [ -f "$SPARKLE_FW/Versions/B/Autoupdate" ] && \
-            codesign --force --options runtime --sign "$IDENTITY" --timestamp "$SPARKLE_FW/Versions/B/Autoupdate"
-        codesign --force --options runtime --sign "$IDENTITY" --timestamp "$SPARKLE_FW"
+            retry codesign --force --options runtime --sign "$IDENTITY" --timestamp "$SPARKLE_FW/Versions/B/Autoupdate"
+        retry codesign --force --options runtime --sign "$IDENTITY" --timestamp "$SPARKLE_FW"
     fi
 
     echo "==> Signing app with: $IDENTITY"
-    codesign --force --options runtime \
+    retry codesign --force --options runtime \
         --sign "$IDENTITY" \
         --timestamp \
         --entitlements "$PROJECT_DIR/${APP_NAME}.entitlements" \
@@ -215,7 +231,7 @@ fi
 # ── Sign the DMG itself ──────────────────────────────────────────
 if [ -n "$IDENTITY" ]; then
     echo "==> Signing DMG..."
-    codesign --force --sign "$IDENTITY" --timestamp "$DMG_PATH"
+    retry codesign --force --sign "$IDENTITY" --timestamp "$DMG_PATH"
 fi
 
 # ── Notarize + staple ────────────────────────────────────────────
