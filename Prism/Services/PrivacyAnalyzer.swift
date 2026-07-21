@@ -9,7 +9,12 @@ final class PrivacyAnalyzer {
         concerns.append(contentsOf: detectExcessiveConnections(requests))
         concerns.append(contentsOf: detectFingerprintingHeaders(requests))
         concerns.append(contentsOf: detectTrackingBeacons(requests))
-        return concerns.sorted { $0.severity < $1.severity }
+        // Tiebreak on id so identical traffic always yields identically ordered
+        // results — several detectors iterate unordered dictionaries.
+        return concerns.sorted {
+            if $0.severity != $1.severity { return $0.severity < $1.severity }
+            return $0.id < $1.id
+        }
     }
 
     func categorize(domain: String) -> DomainCategory {
@@ -24,28 +29,25 @@ final class PrivacyAnalyzer {
 
     // MARK: - Detection
 
+    // Pattern-matches unique hosts, not every request — the window can hold
+    // tens of thousands of requests but only a few hundred distinct hosts.
     private func detectTrackers(_ requests: [ProxyRequest]) -> [PrivacyConcern] {
-        var seen = Set<String>()
+        let byHost = Dictionary(grouping: requests) { $0.host.lowercased() }
         var concerns: [PrivacyConcern] = []
 
-        for request in requests {
-            let host = request.host.lowercased()
-            guard !seen.contains(host) else { continue }
-
-            for (pattern, label) in knownTrackers {
-                if host.contains(pattern) {
-                    seen.insert(host)
-                    concerns.append(PrivacyConcern(
-                        timestamp: request.timestamp,
-                        severity: .medium,
-                        category: .tracking,
-                        title: "Tracker detected: \(label)",
-                        detail: "Your traffic includes connections to \(host), a known \(label) service.",
-                        domain: host,
-                        evidence: "\(request.method) \(request.displayURL)"
-                    ))
-                    break
-                }
+        for (host, reqs) in byHost {
+            for (pattern, label) in knownTrackers where host.contains(pattern) {
+                guard let first = reqs.min(by: { $0.timestamp < $1.timestamp }) else { break }
+                concerns.append(PrivacyConcern(
+                    timestamp: first.timestamp,
+                    severity: .medium,
+                    category: .tracking,
+                    title: "Tracker detected: \(label)",
+                    detail: "Your traffic includes connections to \(host), a known \(label) service.",
+                    domain: host,
+                    evidence: "\(first.method) \(first.displayURL)"
+                ))
+                break
             }
         }
 
@@ -58,8 +60,10 @@ final class PrivacyAnalyzer {
 
         guard !httpDomains.isEmpty else { return [] }
 
+        // Deterministic timestamp: the same traffic must produce an identical
+        // concern on every analysis pass (see PrivacyConcern.id).
         return [PrivacyConcern(
-            timestamp: Date(),
+            timestamp: httpRequests.map(\.timestamp).min() ?? Date(),
             severity: .high,
             category: .unencrypted,
             title: "Unencrypted HTTP traffic detected",
@@ -70,19 +74,21 @@ final class PrivacyAnalyzer {
     }
 
     private func detectExcessiveConnections(_ requests: [ProxyRequest]) -> [PrivacyConcern] {
-        let domainCounts = Dictionary(grouping: requests, by: \.host)
-            .mapValues(\.count)
-            .filter { $0.value > 100 }
+        let domainGroups = Dictionary(grouping: requests, by: \.host)
+            .filter { $0.value.count > 100 }
 
-        return domainCounts.map { domain, count in
-            PrivacyConcern(
-                timestamp: Date(),
+        return domainGroups.map { domain, reqs in
+            let count = reqs.count
+            return PrivacyConcern(
+                timestamp: reqs.map(\.timestamp).min() ?? Date(),
                 severity: .low,
                 category: .excessiveConnections,
                 title: "High request volume to \(domain)",
                 detail: "\(count) requests to \(domain) in the current window. This may indicate aggressive polling, telemetry, or tracking.",
                 domain: domain,
-                evidence: "\(count) requests"
+                // The live count lives in `detail`; evidence must stay stable so the
+                // concern's derived id doesn't change every time the count ticks up.
+                evidence: "More than 100 requests in the current window"
             )
         }
     }

@@ -32,7 +32,9 @@ struct DashboardView: View {
                     Text(store.isRunning ? "Proxy Running" : "Proxy Stopped")
                         .font(.headline)
                 }
-                Text("Port \(store.port)")
+                Text(store.isRunning
+                     ? "Port \(store.port) · \(store.activeConnections) active connection\(store.activeConnections == 1 ? "" : "s")"
+                     : "Port \(store.port)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let error = store.errorMessage {

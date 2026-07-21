@@ -12,6 +12,7 @@ final class ProxyStore {
     var errorMessage: String?
     var port: UInt16 = 9080
     var isSystemProxyEnabled = false
+    var activeConnections = 0
 
     private var proxyServer: ProxyServer?
     private let recorder = TrafficRecorder()
@@ -21,6 +22,8 @@ final class ProxyStore {
     private var refreshTimer: Timer?
     private var summaryTimer: Timer?
     private var lastSummaryDate: Date?
+    private var lastAnalyzedGeneration: UInt64 = 0
+    private var analysisInFlight = false
 
     // MARK: - Session Stats
 
@@ -38,9 +41,10 @@ final class ProxyStore {
         requests.reduce(0) { $0 + $1.bytesOut }
     }
 
+    // Derived from the already-analyzed profiles rather than re-categorizing
+    // every request — this is read on the main thread during every render.
     var trackingDomainCount: Int {
-        let trackingHosts = Set(requests.map(\.host).filter { analyzer.categorize(domain: $0).isTracking })
-        return trackingHosts.count
+        domainProfiles.filter { $0.category.isTracking }.count
     }
 
     var encryptionRatio: Double {
@@ -53,8 +57,29 @@ final class ProxyStore {
 
     init() {
         self.summarizer = TrafficSummarizer(analyzer: analyzer)
+
+        let storedPort = UserDefaults.standard.integer(forKey: "proxyPort")
+        if (1...65535).contains(storedPort) {
+            port = UInt16(storedPort)
+        }
+
+        repairStaleSystemProxy()
+        summarizer.pruneOldSummaries(keepDays: summaryRetentionDays)
         summaries = summarizer.loadSummaries()
         isSystemProxyEnabled = systemProxy.isSystemProxyEnabled
+    }
+
+    private var summaryRetentionDays: Int {
+        let stored = UserDefaults.standard.integer(forKey: "summaryRetentionDays")
+        return stored > 0 ? stored : 30
+    }
+
+    /// If a previous run enabled the system proxy and didn't shut down cleanly
+    /// (crash, force quit), the Mac is still routing to a dead port. Undo that.
+    private func repairStaleSystemProxy() {
+        guard UserDefaults.standard.bool(forKey: "prismManagesSystemProxy") else { return }
+        _ = systemProxy.disableSystemProxy()
+        UserDefaults.standard.set(false, forKey: "prismManagesSystemProxy")
     }
 
     func startProxy() {
@@ -113,8 +138,13 @@ final class ProxyStore {
     func toggleSystemProxy() {
         if isSystemProxyEnabled {
             _ = systemProxy.disableSystemProxy()
+            UserDefaults.standard.set(false, forKey: "prismManagesSystemProxy")
         } else {
-            _ = systemProxy.enableSystemProxy(port: port)
+            if systemProxy.enableSystemProxy(port: port) {
+                UserDefaults.standard.set(true, forKey: "prismManagesSystemProxy")
+            } else {
+                errorMessage = "Could not enable the system proxy. macOS may have blocked the change — you can set it manually in System Settings → Network, or check the port in Prism's settings."
+            }
         }
         isSystemProxyEnabled = systemProxy.isSystemProxyEnabled
     }
@@ -150,14 +180,49 @@ final class ProxyStore {
     }
 
     private func refreshData() {
-        requests = recorder.snapshot()
-        concerns = analyzer.analyze(requests)
-        rebuildDomainProfiles()
+        activeConnections = proxyServer?.activeConnectionCount ?? 0
+
+        // Idle ticks (no new traffic) and ticks arriving while an analysis is
+        // already running cost nothing. The heavy work runs off the main actor;
+        // only the publish hops back.
+        guard !analysisInFlight,
+              let (snapshot, generation) = recorder.snapshotIfChanged(since: lastAnalyzedGeneration) else {
+            return
+        }
+
+        analysisInFlight = true
+        let analyzer = self.analyzer
+        Task.detached(priority: .utility) { [weak self] in
+            let concerns = analyzer.analyze(snapshot)
+            let profiles = ProxyStore.buildDomainProfiles(
+                requests: snapshot, concerns: concerns, analyzer: analyzer
+            )
+            await self?.applyAnalysis(
+                requests: snapshot, concerns: concerns, profiles: profiles, generation: generation
+            )
+        }
     }
 
-    private func rebuildDomainProfiles() {
+    private func applyAnalysis(
+        requests: [ProxyRequest],
+        concerns: [PrivacyConcern],
+        profiles: [DomainProfile],
+        generation: UInt64
+    ) {
+        self.requests = requests
+        self.concerns = concerns
+        self.domainProfiles = profiles
+        lastAnalyzedGeneration = generation
+        analysisInFlight = false
+    }
+
+    nonisolated private static func buildDomainProfiles(
+        requests: [ProxyRequest],
+        concerns: [PrivacyConcern],
+        analyzer: PrivacyAnalyzer
+    ) -> [DomainProfile] {
         let grouped = Dictionary(grouping: requests, by: \.host)
-        domainProfiles = grouped.map { host, reqs in
+        return grouped.map { host, reqs in
             let category = analyzer.categorize(domain: host)
             var profile = DomainProfile.from(requests: reqs, category: category)
             profile.concerns = concerns.filter { $0.domain == host }
@@ -175,7 +240,7 @@ final class ProxyStore {
     }
 
     func pruneSummaries() {
-        summarizer.pruneOldSummaries()
+        summarizer.pruneOldSummaries(keepDays: summaryRetentionDays)
         summaries = summarizer.loadSummaries()
     }
 }

@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 struct LiveTrafficView: View {
     @Environment(ProxyStore.self) private var store
@@ -44,6 +46,32 @@ struct LiveTrafficView: View {
         }
         .sheet(item: $selectedRequest) { request in
             RequestDetailSheet(request: request)
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button("Export CSV") {
+                    exportCSV()
+                }
+                .disabled(filteredRequests.isEmpty)
+                .help("Export the currently filtered requests as CSV")
+            }
+        }
+    }
+
+    // MARK: - Export
+
+    private func exportCSV() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.nameFieldStringValue = "prism-traffic.csv"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try TrafficExporter.csv(for: filteredRequests)
+                .write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            NSAlert(error: error).runModal()
         }
     }
 

@@ -6,6 +6,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // Leaving the system proxy pointed at a dead port would break networking
+        // for the whole Mac. Only undo it if Prism was the one who enabled it.
+        if UserDefaults.standard.bool(forKey: "prismManagesSystemProxy") {
+            _ = SystemProxyManager().disableSystemProxy()
+            UserDefaults.standard.set(false, forKey: "prismManagesSystemProxy")
+        }
+    }
+
     @objc func showAboutPanel(_ sender: Any?) {
         let creditsText = """
         See through your network traffic.

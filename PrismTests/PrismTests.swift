@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import Prism
 
 @Suite("TrafficRecorder")
@@ -57,6 +58,38 @@ struct TrafficRecorderTests {
         let snapshot = recorder.snapshot()
         #expect(snapshot.first?.completedAt != nil)
     }
+
+    @Test("Prunes requests older than one hour")
+    func pruning() {
+        let recorder = TrafficRecorder()
+        recorder.record(ProxyRequest(
+            timestamp: Date().addingTimeInterval(-7200),
+            method: "GET", host: "old.example.com", port: 80, isEncrypted: false
+        ))
+        recorder.record(ProxyRequest(
+            method: "GET", host: "new.example.com", port: 80, isEncrypted: false
+        ))
+
+        let snapshot = recorder.snapshot()
+        #expect(snapshot.count == 1)
+        #expect(snapshot.first?.host == "new.example.com")
+    }
+
+    @Test("snapshotIfChanged returns nil when nothing changed")
+    func generationGating() {
+        let recorder = TrafficRecorder()
+        let request = ProxyRequest(method: "GET", host: "example.com", port: 80, isEncrypted: false)
+        recorder.record(request)
+
+        let first = recorder.snapshotIfChanged(since: 0)
+        #expect(first != nil)
+
+        let second = recorder.snapshotIfChanged(since: first?.generation ?? 0)
+        #expect(second == nil)
+
+        recorder.updateBytes(id: request.id, bytesIn: 10)
+        #expect(recorder.snapshotIfChanged(since: first?.generation ?? 0) != nil)
+    }
 }
 
 @Suite("PrivacyAnalyzer")
@@ -95,6 +128,38 @@ struct PrivacyAnalyzerTests {
         let concerns = analyzer.analyze(requests)
         let tracking = concerns.filter { $0.category == .tracking }
         #expect(!tracking.isEmpty)
+    }
+
+    @Test("Concern identity is stable across repeated analysis of the same traffic")
+    func stableConcernIdentity() {
+        let analyzer = PrivacyAnalyzer()
+        let requests = [
+            ProxyRequest(method: "CONNECT", host: "www.google-analytics.com", port: 443, isEncrypted: true),
+            ProxyRequest(method: "GET", host: "insecure.com", port: 80, path: "/", isEncrypted: false),
+        ]
+
+        let first = analyzer.analyze(requests)
+        let second = analyzer.analyze(requests)
+
+        #expect(first.map(\.id) == second.map(\.id))
+        #expect(first == second)
+    }
+
+    @Test("Excessive-connection concern identity survives a growing request count")
+    func excessiveConnectionIdentityStable() {
+        let analyzer = PrivacyAnalyzer()
+        let base = (0..<101).map { _ in
+            ProxyRequest(method: "CONNECT", host: "chatty.example.com", port: 443, isEncrypted: true)
+        }
+        let grown = base + [
+            ProxyRequest(method: "CONNECT", host: "chatty.example.com", port: 443, isEncrypted: true)
+        ]
+
+        let firstID = analyzer.analyze(base).first { $0.category == .excessiveConnections }?.id
+        let secondID = analyzer.analyze(grown).first { $0.category == .excessiveConnections }?.id
+
+        #expect(firstID != nil)
+        #expect(firstID == secondID)
     }
 }
 
@@ -141,5 +206,40 @@ struct TrafficSummarizerTests {
         #expect(summary.httpsRequests == 2)
         #expect(summary.httpRequests == 1)
         #expect(summary.totalBytesIn == 3500)
+    }
+}
+
+@Suite("TrafficExporter")
+struct TrafficExporterTests {
+
+    @Test("Exports requests as CSV with header row")
+    func csvBasic() {
+        let requests = [
+            ProxyRequest(
+                method: "GET", host: "example.com", port: 80, path: "/index.html",
+                isEncrypted: false, responseStatus: 200, bytesIn: 1024, bytesOut: 256
+            )
+        ]
+
+        let csv = TrafficExporter.csv(for: requests)
+        let lines = csv.split(separator: "\n")
+
+        #expect(lines.count == 2)
+        #expect(lines[0] == "timestamp,method,scheme,host,port,path,status,bytes_in,bytes_out,duration_ms")
+        #expect(lines[1].contains("GET,http,example.com,80,/index.html,200,1024,256"))
+    }
+
+    @Test("Escapes fields containing commas and quotes")
+    func csvEscaping() {
+        let requests = [
+            ProxyRequest(
+                method: "GET", host: "example.com", port: 80,
+                path: "/search?q=\"a,b\"", isEncrypted: false
+            )
+        ]
+
+        let csv = TrafficExporter.csv(for: requests)
+
+        #expect(csv.contains("\"/search?q=\"\"a,b\"\"\""))
     }
 }

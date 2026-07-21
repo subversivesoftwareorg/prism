@@ -1,7 +1,6 @@
 import Foundation
 
 struct PrivacyConcern: Identifiable, Codable, Hashable {
-    let id: UUID
     let timestamp: Date
     let severity: ConcernSeverity
     let category: ConcernCategory
@@ -9,6 +8,11 @@ struct PrivacyConcern: Identifiable, Codable, Hashable {
     let detail: String
     let domain: String
     let evidence: String
+
+    /// Identity derives from content, not a per-instance UUID, so re-running the
+    /// analyzer over the same traffic yields the *same* concern. This keeps SwiftUI
+    /// diffing stable across refreshes and makes "seen"/dismissal state possible.
+    var id: String { "\(category.rawValue)|\(domain)|\(evidence)" }
 
     init(
         timestamp: Date = Date(),
@@ -19,7 +23,6 @@ struct PrivacyConcern: Identifiable, Codable, Hashable {
         domain: String,
         evidence: String
     ) {
-        self.id = UUID()
         self.timestamp = timestamp
         self.severity = severity
         self.category = category

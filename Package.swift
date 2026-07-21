@@ -21,7 +21,8 @@ let package = Package(
         .testTarget(
             name: "PrismTests",
             dependencies: ["Prism"],
-            path: "PrismTests"
+            path: "PrismTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
 )

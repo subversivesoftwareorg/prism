@@ -16,8 +16,10 @@ final class SystemProxyManager {
         let r2 = shell("networksetup -setsecurewebproxy '\(service)' 127.0.0.1 \(p)")
         let r3 = shell("networksetup -setwebproxystate '\(service)' on")
         let r4 = shell("networksetup -setsecurewebproxystate '\(service)' on")
+        // Local and link-local traffic should never round-trip through the proxy.
+        let r5 = shell("networksetup -setproxybypassdomains '\(service)' localhost 127.0.0.1 '*.local' 169.254/16")
 
-        _ = (r1, r2, r3, r4)
+        _ = (r1, r2, r3, r4, r5)
         return isSystemProxyEnabled
     }
 

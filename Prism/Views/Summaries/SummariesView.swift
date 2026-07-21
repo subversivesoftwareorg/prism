@@ -20,8 +20,8 @@ struct SummariesView: View {
                 Button("Generate Now") {
                     store.generateSummaryNow()
                 }
-                .disabled(!store.isRunning || store.requests.isEmpty)
-                .help("Generate a summary of current traffic")
+                .disabled(store.requests.isEmpty)
+                .help("Generate a summary of the captured traffic")
             }
         }
     }
