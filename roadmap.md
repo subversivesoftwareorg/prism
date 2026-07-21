@@ -95,8 +95,32 @@ connections are tracked and released; the fd soft limit is raised to 10240 at
 startup; os.Logger debug logging throughout (subsystem
 `com.subversivesoftware.prism`); a 10-second health watchdog probes the
 listener and auto-disables the system proxy if it stops answering; and
-stopping the proxy now drops the system proxy first. Design rule going
+stopping the proxy now drops the system proxy first. **Idle timeout** (120s
+default): CONNECT tunnels that carry no data in either direction for 120
+seconds are torn down automatically — this handles HTTP/2 multiplexed,
+WebSocket, and long-polling connections that never send TCP FIN and would
+otherwise accumulate indefinitely. **Connection cap** (2000): new
+connections beyond the cap receive 503 and are closed immediately — prevents
+fd exhaustion during traffic spikes. **Adaptive idle timeout**: when active
+connections exceed 200 the idle timeout drops to 60s; above 500 it drops to
+30s — existing tunnels drain faster under pressure. Design rule going
 forward: **a sick proxy must never take the Mac's connectivity down with it.**
+
+### 1.9 Daily summary pruning (stability fix) — ✅ done
+In-memory `summaries` array grew without bound because pruning only ran at
+app launch. Added a daily timer that prunes both on-disk JSON files and the
+in-memory array, using the configured retention period.
+
+### 1.10 SQLite-backed history — ✅ done
+`TrafficDatabase` wraps the sqlite3 C API (WAL mode, busy timeout) with
+three tables: `requests` (individual records, no headers), `hourly_stats`
+(one row per hour with domain breakdown JSON), and `domain_catalog`
+(first/last-seen per domain). A 30-second drain timer flushes completed
+requests from the in-memory ring buffer to SQLite; a daily prune removes
+raw rows older than the retention period and hourly stats older than 6
+months. Hourly stats are recorded alongside each summary generation.
+The domain catalog uses idempotent MIN/MAX upserts, so repeated drains
+never inflate data.
 
 ---
 
@@ -203,12 +227,11 @@ user can't get out is data they don't own.
 The 1-hour in-memory window and per-hour JSON files can't answer "is this normal?" —
 and *normal vs. new* is the core of useful privacy insight.
 
-### 4.1 SQLite-backed history (L)
-Move durable storage to `sqlite3` (allowed by conventions): compact per-request rows
-(domain, app, timestamps, bytes, category — not headers) with rollup tables per
-hour/day. In-memory recorder stays as the hot buffer; a writer drains it. Retention
-policies per tier (raw rows: days; hourly rollups: months; daily rollups: forever).
-JSON summaries in Application Support remain as the export format, not the database.
+### 4.1 SQLite-backed history (L) — ✅ done (see 1.10)
+Core infrastructure landed in Phase 1 for stability: `requests`, `hourly_stats`, and
+`domain_catalog` tables; 30-second drain; daily prune with tiered retention. Remaining
+work: daily rollup table (aggregate from hourly for long-term trends), app attribution
+column (after 2.1), and UI for browsing historical data.
 
 ### 4.2 Trends and baselines (M)
 With history: week-over-week charts (Charts framework), per-domain and per-app baselines,

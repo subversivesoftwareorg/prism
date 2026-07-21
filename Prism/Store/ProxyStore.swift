@@ -27,6 +27,9 @@ final class ProxyStore {
     private var analysisInFlight = false
     private var healthTimer: Timer?
     private var consecutiveHealthFailures = 0
+    private var database: TrafficDatabase?
+    private var drainTimer: Timer?
+    private var pruneTimer: Timer?
 
     // MARK: - Session Stats
 
@@ -70,6 +73,13 @@ final class ProxyStore {
         summarizer.pruneOldSummaries(keepDays: summaryRetentionDays)
         summaries = summarizer.loadSummaries()
         isSystemProxyEnabled = systemProxy.isSystemProxyEnabled
+
+        do {
+            database = try TrafficDatabase()
+        } catch {
+            ProxyLog.proxy.error("failed to open traffic database: \(error.localizedDescription, privacy: .public)")
+        }
+        startPruneTimer()
     }
 
     private var summaryRetentionDays: Int {
@@ -113,6 +123,7 @@ final class ProxyStore {
             startRefreshTimer()
             startSummaryTimer()
             startHealthTimer()
+            startDrainTimer()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -135,6 +146,9 @@ final class ProxyStore {
         summaryTimer = nil
         healthTimer?.invalidate()
         healthTimer = nil
+        drainTimer?.invalidate()
+        drainTimer = nil
+        finalDrain()
         consecutiveHealthFailures = 0
         isRunning = false
         proxyState = .stopped
@@ -174,6 +188,14 @@ final class ProxyStore {
         summarizer.save(summary)
         summaries.insert(summary, at: 0)
         lastSummaryDate = Date()
+
+        if let database = database {
+            let hourStart = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970 / 3600) * 3600)
+            let reqs = snapshot
+            Task.detached(priority: .utility) {
+                try? database.recordHourlyStat(hourStart: hourStart, requests: reqs)
+            }
+        }
     }
 
     // MARK: - Timers
@@ -314,6 +336,68 @@ final class ProxyStore {
             profile.concerns = concerns.filter { $0.domain == host }
             return profile
         }.sorted { $0.requestCount > $1.requestCount }
+    }
+
+    // MARK: - Database
+
+    private func startDrainTimer() {
+        drainTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.drainToDatabase()
+            }
+        }
+    }
+
+    private func startPruneTimer() {
+        pruneTimer = Timer.scheduledTimer(withTimeInterval: 86400, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pruneAll()
+            }
+        }
+    }
+
+    private func drainToDatabase() {
+        guard let database = database else { return }
+        let completed = recorder.snapshot().filter { $0.completedAt != nil }
+        guard !completed.isEmpty else { return }
+
+        Task.detached(priority: .utility) {
+            do {
+                try database.insertRequests(completed)
+                try database.updateDomainCatalog(from: completed)
+            } catch {
+                ProxyLog.proxy.error("database drain failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    private func finalDrain() {
+        guard let database = database else { return }
+        let completed = recorder.snapshot().filter { $0.completedAt != nil }
+        guard !completed.isEmpty else { return }
+        do {
+            try database.insertRequests(completed)
+            try database.updateDomainCatalog(from: completed)
+        } catch {
+            ProxyLog.proxy.error("final drain failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func pruneAll() {
+        summarizer.pruneOldSummaries(keepDays: summaryRetentionDays)
+        summaries = summarizer.loadSummaries()
+
+        guard let database = database else { return }
+        let days = summaryRetentionDays
+        Task.detached(priority: .utility) {
+            do {
+                try database.pruneRequests(olderThanDays: days)
+                try database.pruneHourlyStats(olderThanMonths: 6)
+                ProxyLog.proxy.info("database pruned: requests > \(days, privacy: .public) days, hourly stats > 6 months")
+            } catch {
+                ProxyLog.proxy.error("database prune failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     // MARK: - Cleanup

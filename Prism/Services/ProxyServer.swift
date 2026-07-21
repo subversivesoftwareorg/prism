@@ -7,6 +7,16 @@ final class ProxyServer {
     private let recorder: TrafficRecorder
     private let queue = DispatchQueue(label: "com.subversivesoftware.prism.proxy", qos: .userInitiated)
     private(set) var port: UInt16
+    var tunnelIdleTimeout: TimeInterval = 120
+    var maxConnections = 2000
+
+    private var effectiveIdleTimeout: TimeInterval {
+        let count = activeConnectionCount
+        if count > 500 { return min(tunnelIdleTimeout, 30) }
+        if count > 200 { return min(tunnelIdleTimeout, 60) }
+        return tunnelIdleTimeout
+    }
+
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private let connectionsLock = NSLock()
 
@@ -148,6 +158,12 @@ final class ProxyServer {
     // MARK: - Request Head Buffering
 
     private func handleNewConnection(_ client: NWConnection) {
+        if activeConnectionCount >= maxConnections {
+            ProxyLog.proxy.warning("connection cap (\(self.maxConnections, privacy: .public)) reached — rejecting")
+            client.start(queue: queue)
+            sendErrorAndClose(client, status: "503 Service Unavailable")
+            return
+        }
         track(client)
         client.start(queue: queue)
         receiveRequestHead(from: client, buffer: Data())
@@ -231,6 +247,15 @@ final class ProxyServer {
                         server.send(content: earlyData, completion: .contentProcessed { _ in })
                     }
                     let tunnel = TunnelState()
+                    tunnel.setIdleHandler { [weak self] in
+                        ProxyLog.proxy.debug("tunnel idle \(authority.host, privacy: .public):\(authority.port, privacy: .public) — tearing down")
+                        client.cancel()
+                        server.cancel()
+                        self?.recorder.complete(id: record.id)
+                    }
+                    if let self = self {
+                        tunnel.resetIdleTimer(on: self.queue, timeout: self.effectiveIdleTimeout)
+                    }
                     self?.relay(from: client, to: server, recordID: record.id,
                                 direction: .outbound, accumulator: ByteAccumulator(), tunnel: tunnel)
                     self?.relay(from: server, to: client, recordID: record.id,
@@ -382,13 +407,33 @@ final class ProxyServer {
         accumulator.pending = 0
     }
 
-    // Tracks how many of a tunnel's two relay directions have finished, so the
-    // connections are cancelled exactly when both sides are done. Without this
-    // teardown, gracefully closed tunnels leaked two file descriptors each —
-    // enough real-world browsing exhausted the process fd limit and every
-    // proxied app hung. Mutated only on the proxy's serial queue.
     private final class TunnelState {
         var finishedDirections = 0
+        private(set) var tornDown = false
+        private var timeoutItem: DispatchWorkItem?
+        private var onTimeout: (() -> Void)?
+
+        func setIdleHandler(_ handler: @escaping () -> Void) {
+            onTimeout = handler
+        }
+
+        func markTornDown() {
+            tornDown = true
+            timeoutItem?.cancel()
+            timeoutItem = nil
+        }
+
+        func resetIdleTimer(on queue: DispatchQueue, timeout: TimeInterval) {
+            guard !tornDown, onTimeout != nil else { return }
+            timeoutItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                guard let self = self, !self.tornDown else { return }
+                self.markTornDown()
+                self.onTimeout?()
+            }
+            timeoutItem = item
+            queue.asyncAfter(deadline: .now() + timeout, execute: item)
+        }
     }
 
     private func relay(from source: NWConnection, to destination: NWConnection,
@@ -398,6 +443,7 @@ final class ProxyServer {
             guard let self = self else { return }
 
             if let data = data, !data.isEmpty {
+                tunnel.resetIdleTimer(on: self.queue, timeout: self.effectiveIdleTimeout)
                 accumulator.pending += data.count
                 if accumulator.pending >= Self.byteFlushThreshold {
                     self.flush(accumulator, recordID: recordID, direction: direction)
@@ -411,6 +457,7 @@ final class ProxyServer {
                         self.finishDirection(tunnel, source: source, destination: destination,
                                              recordID: recordID, direction: direction, accumulator: accumulator)
                     } else {
+                        tunnel.markTornDown()
                         self.flush(accumulator, recordID: recordID, direction: direction)
                         source.cancel()
                         destination.cancel()
@@ -418,6 +465,7 @@ final class ProxyServer {
                     }
                 })
             } else if error != nil {
+                tunnel.markTornDown()
                 self.flush(accumulator, recordID: recordID, direction: direction)
                 source.cancel()
                 destination.cancel()
@@ -435,7 +483,7 @@ final class ProxyServer {
         tunnel.finishedDirections += 1
 
         if tunnel.finishedDirections >= 2 {
-            // Both directions saw FIN — tear down so the descriptors release.
+            tunnel.markTornDown()
             source.cancel()
             destination.cancel()
             recorder.complete(id: recordID)

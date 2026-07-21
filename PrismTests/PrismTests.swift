@@ -209,6 +209,76 @@ struct TrafficSummarizerTests {
     }
 }
 
+@Suite("TrafficDatabase")
+struct TrafficDatabaseTests {
+
+    @Test("Inserts and counts requests")
+    func insertAndCount() throws {
+        let db = try TrafficDatabase(path: ":memory:")
+
+        let r = ProxyRequest(method: "GET", host: "example.com", port: 80,
+                             path: "/test", isEncrypted: false, completedAt: Date())
+        try db.insertRequests([r])
+        #expect(try db.totalRequestCount() == 1)
+
+        try db.insertRequests([r])
+        #expect(try db.totalRequestCount() == 1)
+    }
+
+    @Test("Tracks domain first-seen dates")
+    func domainCatalog() throws {
+        let db = try TrafficDatabase(path: ":memory:")
+
+        let t1 = Date().addingTimeInterval(-3600)
+        let r1 = ProxyRequest(timestamp: t1, method: "GET", host: "example.com",
+                              port: 80, isEncrypted: false)
+        try db.updateDomainCatalog(from: [r1])
+
+        let firstSeen = try db.domainFirstSeen("example.com")
+        #expect(firstSeen != nil)
+        #expect(abs(firstSeen!.timeIntervalSince(t1)) < 1)
+        #expect(try db.totalDomainCount() == 1)
+        #expect(try db.domainFirstSeen("never.seen") == nil)
+
+        let r2 = ProxyRequest(method: "GET", host: "example.com", port: 80, isEncrypted: false)
+        try db.updateDomainCatalog(from: [r2])
+        let still = try db.domainFirstSeen("example.com")
+        #expect(abs(still!.timeIntervalSince(t1)) < 1)
+    }
+
+    @Test("Prunes old requests")
+    func pruning() throws {
+        let db = try TrafficDatabase(path: ":memory:")
+
+        let old = ProxyRequest(timestamp: Date().addingTimeInterval(-86400 * 10),
+                               method: "GET", host: "old.com", port: 80,
+                               isEncrypted: false, completedAt: Date().addingTimeInterval(-86400 * 10))
+        let recent = ProxyRequest(method: "GET", host: "new.com", port: 80,
+                                  isEncrypted: false, completedAt: Date())
+        try db.insertRequests([old, recent])
+        #expect(try db.totalRequestCount() == 2)
+
+        try db.pruneRequests(olderThanDays: 7)
+        #expect(try db.totalRequestCount() == 1)
+    }
+
+    @Test("Records hourly statistics")
+    func hourlyStats() throws {
+        let db = try TrafficDatabase(path: ":memory:")
+
+        let requests = [
+            ProxyRequest(method: "GET", host: "a.com", port: 80,
+                         isEncrypted: false, bytesIn: 100, bytesOut: 50),
+            ProxyRequest(method: "CONNECT", host: "b.com", port: 443,
+                         isEncrypted: true, bytesIn: 200, bytesOut: 150)
+        ]
+        let hourStart = Date(timeIntervalSince1970:
+            floor(Date().timeIntervalSince1970 / 3600) * 3600)
+        try db.recordHourlyStat(hourStart: hourStart, requests: requests)
+        #expect(try db.hourlyStatCount() == 1)
+    }
+}
+
 @Suite("TrafficExporter")
 struct TrafficExporterTests {
 

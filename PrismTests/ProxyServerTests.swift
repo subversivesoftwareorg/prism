@@ -375,6 +375,66 @@ struct ProxyServerIntegrationTests {
         #expect(recorder.count == 0)
     }
 
+    @Test("Idle CONNECT tunnels are torn down after the timeout")
+    func idleTunnelTimeout() async throws {
+        let origin = try await TestOrigin.start(mode: .echo)
+        defer { origin.stop() }
+
+        let recorder = TrafficRecorder()
+        let proxy = try await startProxy(recorder: recorder)
+        proxy.tunnelIdleTimeout = 2
+        defer { proxy.stop() }
+
+        let client = try await openConnection(port: proxy.port)
+        defer { client.cancel() }
+
+        let connect = "CONNECT 127.0.0.1:\(origin.port) HTTP/1.1\r\nHost: 127.0.0.1:\(origin.port)\r\n\r\n"
+        try await send(Data(connect.utf8), over: client)
+
+        let established = try await withTimeout { await receiveChunk(client).data ?? Data() }
+        #expect(String(data: established, encoding: .utf8)?.contains("200 Connection Established") == true)
+
+        let payload = Data("hello".utf8)
+        try await send(payload, over: client)
+        let echoed = try await withTimeout { await receiveChunk(client).data ?? Data() }
+        #expect(echoed == payload)
+
+        #expect(proxy.activeConnectionCount > 0)
+
+        // No more data — the proxy should tear down after ~2 seconds of silence.
+        try await pollUntil(timeout: 10) { proxy.activeConnectionCount == 0 }
+
+        let record = try #require(recorder.snapshot().first)
+        #expect(record.completedAt != nil)
+    }
+
+    @Test("Rejects connections beyond the cap with 503")
+    func connectionCap() async throws {
+        let recorder = TrafficRecorder()
+        let proxy = try await startProxy(recorder: recorder)
+        let saved = proxy.maxConnections
+        proxy.maxConnections = 3
+        defer {
+            proxy.maxConnections = saved
+            proxy.stop()
+        }
+
+        var holders: [NWConnection] = []
+        defer { holders.forEach { $0.cancel() } }
+
+        for _ in 0..<3 {
+            holders.append(try await openConnection(port: proxy.port))
+        }
+        try await pollUntil { proxy.activeConnectionCount >= 3 }
+
+        let overflow = try await openConnection(port: proxy.port)
+        defer { overflow.cancel() }
+
+        let response = try await withTimeout { await receiveAll(over: overflow) }
+        let text = String(data: response, encoding: .utf8) ?? ""
+        #expect(text.contains("503"))
+    }
+
     @Test("CONNECT to an unreachable port returns 502")
     func connectRefused() async throws {
         let recorder = TrafficRecorder()

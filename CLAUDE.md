@@ -28,6 +28,7 @@ log stream --predicate 'subsystem == "com.subversivesoftware.prism"' --level deb
 - **TrafficSummarizer** — Generates hourly summaries with domain breakdowns and privacy analysis. Persists to ~/Library/Application Support/Prism/summaries/.
 - **PrivacyAnalyzer** — Detects known trackers, unencrypted traffic, fingerprinting headers, tracking beacons, and excessive connections.
 - **SystemProxyManager** — Configures macOS system HTTP proxy via `networksetup`.
+- **TrafficDatabase** — SQLite-backed persistent history. Stores completed requests (no headers), hourly stats with domain breakdown, and a domain catalog for first-seen tracking. WAL mode, NSLock-serialized, 30-second drain from recorder.
 - **ProxyStore** — @Observable @MainActor state container. Refreshes UI every 2 seconds via Timer.
 
 ## Key Design Decisions
@@ -36,6 +37,8 @@ log stream --predicate 'subsystem == "com.subversivesoftware.prism"' --level deb
 - TrafficRecorder uses NSLock (not Swift actor) because the proxy runs on DispatchQueues.
 - HTTPS traffic is tunneled, not decrypted — Prism sees the target hostname and byte volume, not the content.
 - Default port: 9080.
+- CONNECT tunnels have a 120-second idle timeout (adaptive: shorter under load). Connection cap at 2000 prevents fd exhaustion.
+- SQLite database at ~/Library/Application Support/Prism/traffic.db. Daily pruning: raw requests follow summaryRetentionDays, hourly stats kept 6 months.
 
 ## Bundle ID
 
