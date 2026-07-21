@@ -12,6 +12,15 @@ swift build -c release       # Release build
 swift test                   # Run tests
 ```
 
+## Debugging
+
+Structured logs via os.Logger, subsystem `com.subversivesoftware.prism`
+(categories: `proxy`, `health`, `system-proxy`):
+
+```bash
+log stream --predicate 'subsystem == "com.subversivesoftware.prism"' --level debug
+```
+
 ## Architecture
 
 - **ProxyServer** — Network.framework TCP proxy. Handles HTTP (full request/response observation) and HTTPS CONNECT (hostname + byte count only).

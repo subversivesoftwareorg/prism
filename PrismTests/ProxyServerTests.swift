@@ -288,6 +288,9 @@ struct ProxyServerIntegrationTests {
 
         try await pollUntil { recorder.snapshot().first?.path == "/direct" }
         #expect(recorder.snapshot().first?.port == origin.port)
+
+        // All connections (client and upstream) release after the exchange.
+        try await pollUntil { proxy.activeConnectionCount == 0 }
     }
 
     @Test("CONNECT tunnels bytes both ways and counts them")
@@ -324,6 +327,11 @@ struct ProxyServerIntegrationTests {
         #expect(record.isEncrypted)
         #expect(record.host == "127.0.0.1")
         #expect(record.port == origin.port)
+
+        // The regression that hung real-world use: closed tunnels must release
+        // BOTH connections, or the process leaks two file descriptors per
+        // tunnel until the fd limit kills all new connections.
+        try await pollUntil { proxy.activeConnectionCount == 0 }
     }
 
     @Test("Parses a request head that arrives split across packets")

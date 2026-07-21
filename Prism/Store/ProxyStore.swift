@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 @Observable
 @MainActor
@@ -24,6 +25,8 @@ final class ProxyStore {
     private var lastSummaryDate: Date?
     private var lastAnalyzedGeneration: UInt64 = 0
     private var analysisInFlight = false
+    private var healthTimer: Timer?
+    private var consecutiveHealthFailures = 0
 
     // MARK: - Session Stats
 
@@ -109,18 +112,30 @@ final class ProxyStore {
             proxyServer = server
             startRefreshTimer()
             startSummaryTimer()
+            startHealthTimer()
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
     func stopProxy() {
+        // Never leave the Mac routing traffic to a proxy that no longer exists.
+        if isSystemProxyEnabled && UserDefaults.standard.bool(forKey: "prismManagesSystemProxy") {
+            ProxyLog.system.info("proxy stopping — disabling system proxy first")
+            _ = systemProxy.disableSystemProxy()
+            UserDefaults.standard.set(false, forKey: "prismManagesSystemProxy")
+            isSystemProxyEnabled = systemProxy.isSystemProxyEnabled
+        }
+
         proxyServer?.stop()
         proxyServer = nil
         refreshTimer?.invalidate()
         refreshTimer = nil
         summaryTimer?.invalidate()
         summaryTimer = nil
+        healthTimer?.invalidate()
+        healthTimer = nil
+        consecutiveHealthFailures = 0
         isRunning = false
         proxyState = .stopped
     }
@@ -176,6 +191,77 @@ final class ProxyStore {
             Task { @MainActor [weak self] in
                 self?.generateSummaryNow()
             }
+        }
+    }
+
+    // MARK: - Health Watchdog
+
+    // The one guarantee Prism must keep: a sick proxy never takes the Mac's
+    // connectivity down with it. Every 10 seconds, probe our own listener;
+    // if it stops accepting, drop the system proxy immediately.
+    private func startHealthTimer() {
+        consecutiveHealthFailures = 0
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.probeProxyHealth()
+            }
+        }
+    }
+
+    private func probeProxyHealth() {
+        guard isRunning, let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+
+        let probe = NWConnection(host: "127.0.0.1", port: nwPort, using: .tcp)
+        let probeQueue = DispatchQueue(label: "com.subversivesoftware.prism.healthprobe")
+        var settled = false
+
+        let finish: (Bool) -> Void = { [weak self] healthy in
+            guard !settled else { return }
+            settled = true
+            probe.cancel()
+            Task { @MainActor [weak self] in
+                self?.recordHealthResult(healthy: healthy)
+            }
+        }
+
+        probe.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                finish(true)
+            case .failed, .waiting:
+                finish(false)
+            default:
+                break
+            }
+        }
+        probe.start(queue: probeQueue)
+        probeQueue.asyncAfter(deadline: .now() + 3) {
+            finish(false)
+        }
+    }
+
+    private func recordHealthResult(healthy: Bool) {
+        if healthy {
+            if consecutiveHealthFailures > 0 {
+                ProxyLog.health.info("proxy listener recovered after \(self.consecutiveHealthFailures, privacy: .public) failed probe(s)")
+            }
+            consecutiveHealthFailures = 0
+            return
+        }
+
+        consecutiveHealthFailures += 1
+        ProxyLog.health.error("proxy health probe failed (\(self.consecutiveHealthFailures, privacy: .public) consecutive), active connections: \(self.activeConnections, privacy: .public)")
+
+        guard consecutiveHealthFailures >= 2 else { return }
+
+        if isSystemProxyEnabled && UserDefaults.standard.bool(forKey: "prismManagesSystemProxy") {
+            ProxyLog.health.fault("proxy unresponsive — disabling system proxy to restore connectivity")
+            _ = systemProxy.disableSystemProxy()
+            UserDefaults.standard.set(false, forKey: "prismManagesSystemProxy")
+            isSystemProxyEnabled = systemProxy.isSystemProxyEnabled
+            errorMessage = "Prism's proxy stopped responding, so the system proxy was turned off to protect your connectivity. Traffic is no longer being observed."
+        } else {
+            errorMessage = "Prism's proxy stopped responding to health checks."
         }
     }
 

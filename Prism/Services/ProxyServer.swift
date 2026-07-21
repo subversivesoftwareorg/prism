@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 
 final class ProxyServer {
     private var listener: NWListener?
@@ -28,6 +29,8 @@ final class ProxyServer {
     }
 
     func start() throws {
+        raiseFileDescriptorLimit()
+
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
 
@@ -48,10 +51,13 @@ final class ProxyServer {
                 if let actualPort = self?.listener?.port?.rawValue, actualPort != 0 {
                     self?.port = actualPort
                 }
+                ProxyLog.proxy.info("listener ready on port \(self?.port ?? 0, privacy: .public)")
                 self?.onStateChange?(.running)
             case .failed(let error):
+                ProxyLog.proxy.error("listener failed: \(error.localizedDescription, privacy: .public)")
                 self?.onStateChange?(.failed(error.localizedDescription))
             case .cancelled:
+                ProxyLog.proxy.info("listener cancelled")
                 self?.onStateChange?(.stopped)
             default:
                 break
@@ -76,6 +82,7 @@ final class ProxyServer {
             connections.removeAll()
             return values
         }
+        ProxyLog.proxy.info("stopping, closing \(live.count, privacy: .public) live connection(s)")
         live.forEach { $0.cancel() }
     }
 
@@ -85,15 +92,33 @@ final class ProxyServer {
 
     // MARK: - Connection Tracking
 
-    private func track(_ client: NWConnection) {
-        connectionsLock.withLock {
-            connections[ObjectIdentifier(client)] = client
+    // Every NWConnection (client and upstream) is registered so stop() can
+    // close it and leaks are visible in activeConnectionCount. A connection
+    // that is never unregistered is a file descriptor that is never released —
+    // the process fd limit is the proxy's scarcest resource.
+    private func register(_ connection: NWConnection) {
+        let count = connectionsLock.withLock { () -> Int in
+            connections[ObjectIdentifier(connection)] = connection
+            return connections.count
         }
+        if count > 200 && count % 50 == 0 {
+            ProxyLog.proxy.warning("high connection count: \(count, privacy: .public) — possible leak or fd pressure")
+        }
+    }
+
+    private func unregister(_ connection: NWConnection) {
+        _ = connectionsLock.withLock {
+            connections.removeValue(forKey: ObjectIdentifier(connection))
+        }
+    }
+
+    private func track(_ client: NWConnection) {
+        register(client)
         client.stateUpdateHandler = { [weak self, weak client] state in
             switch state {
             case .cancelled, .failed:
                 if let client = client {
-                    self?.untrack(client)
+                    self?.unregister(client)
                 }
             default:
                 break
@@ -101,9 +126,22 @@ final class ProxyServer {
         }
     }
 
-    private func untrack(_ client: NWConnection) {
-        _ = connectionsLock.withLock {
-            connections.removeValue(forKey: ObjectIdentifier(client))
+    // MARK: - File Descriptors
+
+    // GUI apps inherit launchd's soft limit of 256 open files — a proxy
+    // handling two sockets per tunnel exhausts that in minutes of browsing.
+    private func raiseFileDescriptorLimit() {
+        var limits = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limits) == 0 else { return }
+        let target: rlim_t = min(10240, limits.rlim_max)
+        if limits.rlim_cur < target {
+            let previous = limits.rlim_cur
+            limits.rlim_cur = target
+            if setrlimit(RLIMIT_NOFILE, &limits) == 0 {
+                ProxyLog.proxy.info("raised fd soft limit \(previous, privacy: .public) → \(target, privacy: .public)")
+            } else {
+                ProxyLog.proxy.error("failed to raise fd soft limit from \(previous, privacy: .public)")
+            }
         }
     }
 
@@ -141,9 +179,11 @@ final class ProxyServer {
 
     private func route(head: Data, bodyPrefix: Data, client: NWConnection) {
         guard let requestLine = parseRequestLine(head) else {
+            ProxyLog.proxy.info("unparseable request head, responding 400")
             sendErrorAndClose(client, status: "400 Bad Request")
             return
         }
+        ProxyLog.proxy.debug("\(requestLine.method, privacy: .public) \(requestLine.target, privacy: .public) (active: \(self.activeConnectionCount, privacy: .public))")
 
         if requestLine.method == "CONNECT" {
             handleConnect(requestLine: requestLine, client: client, earlyData: bodyPrefix)
@@ -170,6 +210,7 @@ final class ProxyServer {
         recorder.record(record)
 
         let server = NWConnection(host: NWEndpoint.Host(authority.host), port: nwPort, using: .tcp)
+        register(server)
 
         var established = false
         server.stateUpdateHandler = { [weak self] state in
@@ -189,16 +230,27 @@ final class ProxyServer {
                         self?.recorder.updateBytes(id: record.id, bytesOut: earlyData.count)
                         server.send(content: earlyData, completion: .contentProcessed { _ in })
                     }
+                    let tunnel = TunnelState()
                     self?.relay(from: client, to: server, recordID: record.id,
-                                direction: .outbound, accumulator: ByteAccumulator())
+                                direction: .outbound, accumulator: ByteAccumulator(), tunnel: tunnel)
                     self?.relay(from: server, to: client, recordID: record.id,
-                                direction: .inbound, accumulator: ByteAccumulator())
+                                direction: .inbound, accumulator: ByteAccumulator(), tunnel: tunnel)
                 })
-            case .waiting:
+            case .waiting(let error):
                 // "Waiting" means no viable path right now (e.g. connection refused).
                 // A proxy must fail fast, not park the client until conditions change.
+                ProxyLog.proxy.error("CONNECT upstream unreachable: \(authority.host, privacy: .public):\(authority.port, privacy: .public) — \(error.localizedDescription, privacy: .public)")
                 server.cancel()
-            case .failed, .cancelled:
+            case .failed(let error):
+                ProxyLog.proxy.error("CONNECT upstream failed: \(authority.host, privacy: .public):\(authority.port, privacy: .public) — \(error.localizedDescription, privacy: .public)")
+                self?.unregister(server)
+                if !established {
+                    established = true
+                    self?.sendErrorAndClose(client, status: "502 Bad Gateway")
+                    self?.recorder.complete(id: record.id)
+                }
+            case .cancelled:
+                self?.unregister(server)
                 if !established {
                     established = true
                     self?.sendErrorAndClose(client, status: "502 Bad Gateway")
@@ -257,6 +309,7 @@ final class ProxyServer {
         outbound.append(bodyPrefix)
 
         let server = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        register(server)
 
         var established = false
         server.stateUpdateHandler = { [weak self] state in
@@ -275,12 +328,22 @@ final class ProxyServer {
                     // Any remaining request body streams client→server while the
                     // response relays back the other way.
                     self?.relay(from: client, to: server, recordID: record.id,
-                                direction: .outbound, accumulator: ByteAccumulator())
+                                direction: .outbound, accumulator: ByteAccumulator(), tunnel: TunnelState())
                     self?.relayHTTPResponse(from: server, to: client, recordID: record.id)
                 })
-            case .waiting:
+            case .waiting(let error):
+                ProxyLog.proxy.error("HTTP upstream unreachable: \(host, privacy: .public):\(port, privacy: .public) — \(error.localizedDescription, privacy: .public)")
                 server.cancel()
-            case .failed, .cancelled:
+            case .failed(let error):
+                ProxyLog.proxy.error("HTTP upstream failed: \(host, privacy: .public):\(port, privacy: .public) — \(error.localizedDescription, privacy: .public)")
+                self?.unregister(server)
+                if !established {
+                    established = true
+                    self?.sendErrorAndClose(client, status: "502 Bad Gateway")
+                    self?.recorder.complete(id: record.id)
+                }
+            case .cancelled:
+                self?.unregister(server)
                 if !established {
                     established = true
                     self?.sendErrorAndClose(client, status: "502 Bad Gateway")
@@ -319,8 +382,18 @@ final class ProxyServer {
         accumulator.pending = 0
     }
 
+    // Tracks how many of a tunnel's two relay directions have finished, so the
+    // connections are cancelled exactly when both sides are done. Without this
+    // teardown, gracefully closed tunnels leaked two file descriptors each —
+    // enough real-world browsing exhausted the process fd limit and every
+    // proxied app hung. Mutated only on the proxy's serial queue.
+    private final class TunnelState {
+        var finishedDirections = 0
+    }
+
     private func relay(from source: NWConnection, to destination: NWConnection,
-                       recordID: UUID, direction: RelayDirection, accumulator: ByteAccumulator) {
+                       recordID: UUID, direction: RelayDirection,
+                       accumulator: ByteAccumulator, tunnel: TunnelState) {
         source.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
 
@@ -333,12 +406,10 @@ final class ProxyServer {
                 destination.send(content: data, completion: .contentProcessed { sendError in
                     if sendError == nil && !isComplete {
                         self.relay(from: source, to: destination, recordID: recordID,
-                                   direction: direction, accumulator: accumulator)
+                                   direction: direction, accumulator: accumulator, tunnel: tunnel)
                     } else if isComplete {
-                        self.flush(accumulator, recordID: recordID, direction: direction)
-                        destination.send(content: nil, contentContext: .finalMessage, isComplete: true,
-                                         completion: .contentProcessed { _ in })
-                        self.recorder.complete(id: recordID)
+                        self.finishDirection(tunnel, source: source, destination: destination,
+                                             recordID: recordID, direction: direction, accumulator: accumulator)
                     } else {
                         self.flush(accumulator, recordID: recordID, direction: direction)
                         source.cancel()
@@ -346,12 +417,33 @@ final class ProxyServer {
                         self.recorder.complete(id: recordID)
                     }
                 })
-            } else if isComplete || error != nil {
+            } else if error != nil {
                 self.flush(accumulator, recordID: recordID, direction: direction)
-                destination.send(content: nil, contentContext: .finalMessage, isComplete: true,
-                                 completion: .contentProcessed { _ in })
+                source.cancel()
+                destination.cancel()
                 self.recorder.complete(id: recordID)
+            } else if isComplete {
+                self.finishDirection(tunnel, source: source, destination: destination,
+                                     recordID: recordID, direction: direction, accumulator: accumulator)
             }
+        }
+    }
+
+    private func finishDirection(_ tunnel: TunnelState, source: NWConnection, destination: NWConnection,
+                                 recordID: UUID, direction: RelayDirection, accumulator: ByteAccumulator) {
+        flush(accumulator, recordID: recordID, direction: direction)
+        tunnel.finishedDirections += 1
+
+        if tunnel.finishedDirections >= 2 {
+            // Both directions saw FIN — tear down so the descriptors release.
+            source.cancel()
+            destination.cancel()
+            recorder.complete(id: recordID)
+        } else {
+            // Half-close: propagate the FIN but let the reverse direction
+            // keep flowing (e.g. client done sending, server still responding).
+            destination.send(content: nil, contentContext: .finalMessage, isComplete: true,
+                             completion: .contentProcessed { _ in })
         }
     }
 

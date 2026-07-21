@@ -86,6 +86,18 @@ integration tests: spin up the proxy on an ephemeral port, run a local HTTP serv
 requests are recorded, bytes counted, CONNECT tunneled, malformed input rejected. This is
 the highest-risk untested code in the app.
 
+### 1.8 Connection lifecycle + connectivity watchdog (field fix) — ✅ done
+Ten minutes of real-world use hung every proxied app: gracefully closed
+CONNECT tunnels were never cancelled, leaking two file descriptors each until
+the process hit launchd's 256-fd soft limit and new connections silently
+failed. Fixes: tunnels now tear down when both directions finish; upstream
+connections are tracked and released; the fd soft limit is raised to 10240 at
+startup; os.Logger debug logging throughout (subsystem
+`com.subversivesoftware.prism`); a 10-second health watchdog probes the
+listener and auto-disables the system proxy if it stops answering; and
+stopping the proxy now drops the system proxy first. Design rule going
+forward: **a sick proxy must never take the Mac's connectivity down with it.**
+
 ---
 
 ## Phase 2 — Attribution and smarter analysis

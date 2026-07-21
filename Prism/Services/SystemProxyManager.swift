@@ -9,7 +9,11 @@ final class SystemProxyManager {
     }
 
     func enableSystemProxy(port: UInt16) -> Bool {
-        guard let service = activeNetworkService() else { return false }
+        guard let service = activeNetworkService() else {
+            ProxyLog.system.error("enable failed: no active network service found")
+            return false
+        }
+        ProxyLog.system.info("enabling system proxy on '\(service, privacy: .public)' → 127.0.0.1:\(port, privacy: .public)")
         let p = String(port)
 
         let r1 = shell("networksetup -setwebproxy '\(service)' 127.0.0.1 \(p)")
@@ -24,7 +28,11 @@ final class SystemProxyManager {
     }
 
     func disableSystemProxy() -> Bool {
-        guard let service = activeNetworkService() else { return false }
+        guard let service = activeNetworkService() else {
+            ProxyLog.system.error("disable failed: no active network service found")
+            return false
+        }
+        ProxyLog.system.info("disabling system proxy on '\(service, privacy: .public)'")
 
         let r1 = shell("networksetup -setwebproxystate '\(service)' off")
         let r2 = shell("networksetup -setsecurewebproxystate '\(service)' off")
